@@ -1,71 +1,74 @@
-# streamlit_abba.py
+# streamlit_abba_noneq_v_7_9.py
 # -------------------------------------------------------------
-# Streamlit-Dashboard voor de berekening en visualisatie van debieten van de gemeente Almere volgens de ABBA-berekening. 
-# Ruwe reeksen worden opgehaald uit de API van flevoland.lizard.net en omgerekend naar statusreeksen en debietreeksen (debiet per pomp en instroom) debiet.
-# 
-# -------------------------------------------------------------
-# Volledig opgeschoond:
-# - Eén set plot-functies + één renderblok (gedeelde zoom/pan)
-# - Beide pompen gebruiken bit 9 (aanpasbaar in UI)
-# - Status (bedrijf) vectorized 0/1, visueel ×1000
-# - Pompdebieten = status × netto debiet, maar alléén bij uitstroom (debiet < 0)
-#   en in de grafiek positief getekend (tekenflip)
-# - debiet_in correct (zoals v7.2), los van bit-index
-# - precip_cum uit raster bij LT5 (indien beschikbaar)
-# - Clipping: alleen de debiet-lijn; pomppunten NIET meeclippen
+# ABBA noneq — Cloud-ready met extras:
+# - Pumpstations (Almere + Urk) ophalen en kiezen (code of naam)
+# - Prefix automatisch uit keuze
+# - Vast: bitmask bit 9 voor P1 en P2
+# - s_u verwijderd (vast 1.0)
+# - debiet_in uit waterhoogte (positief = instroom)
+# - pompdebiet = status × debiet (alleen bij uitstroom, dus debiet<0), positief geplot
+# - status ×1000 visueel
+# - KPI's: draaiuren, schakelingen, debiet/draaiuren
+# - Export naar Excel (inputs, outputs, KPIs)
+# - Clipping alleen voor debiet-lijn
 # -------------------------------------------------------------
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Tuple
+import io
 import base64
 
 import numpy as np
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from pandas.api.types import is_datetime64_any_dtype, is_datetime64tz_dtype
+
 import streamlit as st
 import altair as alt
 import pytz
 
 # ---------- BASIS ----------
-st.set_page_config(page_title="ABBA noneq — v7.7", layout="wide")
-LIZARD_BASE = "https://flevoland.lizard.net/api/v4"
-RASTER_UUID_PRECIP = "730d6675-35dd-4a35-aa9b-bfb8155f9ca7"  # 5-min neerslagraster
+st.set_page_config(page_title="ABBA noneq — v7.9", layout="wide")
 EU_TZ = pytz.timezone("Europe/Amsterdam")
+LIZARD_BASE = "https://flevoland.lizard.net/api/v4"
+RASTER_UUID_PRECIP = "730d6675-35dd-4a35-aa9b-bfb8155f9ca7"  # 5-min neerslag
+
+# HTTP session met retries/backoff
 SESSION = requests.Session()
+_retry = Retry(
+    total=3, connect=3, read=3, status=3,
+    backoff_factor=0.7,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=10)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
 
-# ---------- Sidebar (deel 1): auth + locatie ----------
-with st.sidebar:
-    st.header("Authenticatie & locatie")
-
-    # ✅ Defensief: None -> "" zodat .strip() nooit crasht
-    prev_token = st.session_state.get("__lizard_token__", "")
-    token_input = st.text_input("API key (verplicht)", value=prev_token or "", type="password")
-    token = (token_input or "").strip()
-    st.session_state["__lizard_token__"] = token or None
-
-    prev_prefix = st.session_state.get("__abba_prefix__", "212_1")
-    prefix_input = st.text_input("Locatieprefix", value=prev_prefix or "212_1")
-    CODE_PREFIX = (prefix_input or "212_1").strip()
-    st.session_state["__abba_prefix__"] = CODE_PREFIX
-
-    if not token:
-        st.error("Voer een geldige API key in om verder te gaan.")
-        st.stop()
-
-st.title(f"ABBA-berekening voor gemaal {CODE_PREFIX}")
-st.caption("voer de ABBA-berekening per gemaal uit voor je eigen gekozen periode. Vergelijk de data en exporteer eventueel.")
-
-# ---------- Helpers ----------
+# ---------- Helper utils ----------
 def _headers() -> dict:
     up = f"__key__:{(st.session_state.get('__lizard_token__') or '').strip()}"
     return {"Accept": "application/json", "Authorization": f"Basic {base64.b64encode(up.encode()).decode()}"}
 
-def _get(url: str, params: Optional[dict] = None, timeout: int = 30) -> dict:
-    r = SESSION.get(url, params=params, headers=_headers(), timeout=timeout)
-    if r.status_code == 401:
-        st.error("401 Unauthorized — controleer je API key.")
+def _get(url: str, params: Optional[dict] = None, timeout: Tuple[float,float] = (5.0, 25.0)) -> dict:
+    try:
+        r = SESSION.get(url, params=params, headers=_headers(), timeout=timeout)
+        if r.status_code == 401:
+            st.error("401 Unauthorized — controleer je API key.")
+            st.stop()
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.ConnectTimeout:
+        st.error("Timeout bij verbinden met Lizard (connect).")
         st.stop()
-    r.raise_for_status()
-    return r.json()
+    except requests.exceptions.ReadTimeout:
+        st.error("Timeout bij lezen van Lizard (read).")
+        st.stop()
+    except requests.exceptions.RequestException as e:
+        st.error(f"Netwerkfout naar Lizard: {e}")
+        st.stop()
 
 def _to_local(ts):
     s = pd.to_datetime(ts, utc=True)
@@ -78,11 +81,35 @@ def _clip(df: pd.DataFrame, col: str, lo: float, hi: float) -> pd.Series:
 
 # ---------- API helpers ----------
 @st.cache_data(ttl=300)
+def list_pumpstations() -> pd.DataFrame:
+    """Alle gemalen (Almere + Urk) met code en name."""
+    url = f"{LIZARD_BASE}/pumpstations/"
+    params = {"organisation__name__in": "Almere,Urk", "page_size": 100}
+    rows = []
+    while True:
+        data = _get(url, params)
+        for p in data.get("results", []):
+            rows.append({
+                "uuid": p.get("uuid"),
+                "code": (p.get("code") or "").strip(),
+                "name": (p.get("name") or "").strip(),
+            })
+        next_url = data.get("next")
+        if not next_url:
+            break
+        url, params = next_url, None
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["label_code"] = df["code"] + " — " + df["name"]
+        df["label_name"] = df["name"] + " — " + df["code"]
+    return df
+
+@st.cache_data(ttl=300)
 def list_timeseries_for_prefix(prefix: str) -> pd.DataFrame:
     url = f"{LIZARD_BASE}/timeseries/"
     params = {
         "location__code__startswith": prefix,
-        "page_size": 1000,
+        "page_size": 500,
         "expand": "observation_type,location",
     }
     rows = []
@@ -90,8 +117,7 @@ def list_timeseries_for_prefix(prefix: str) -> pd.DataFrame:
         data = _get(url, params)
         for ts in data.get("results", []):
             obs = ts.get("observation_type") or {}
-            param_name = ""
-            unit_name = ""
+            param_name, unit_name = "", ""
             if isinstance(obs, dict):
                 p = obs.get("parameter"); u = obs.get("unit")
                 if isinstance(p, dict):
@@ -187,7 +213,7 @@ def fetch_precip_raster(lat: float, lon: float, start_iso: str, end_iso: str, in
     return df
 
 # ---------- ABBA noneq ----------
-def waterhoogte_to_debiet_noneq(df_h: pd.DataFrame, A_peil: float, B_peil: float, opp: float, s_u: float = 1.0) -> pd.DataFrame:
+def waterhoogte_to_debiet_noneq(df_h: pd.DataFrame, A_peil: float, B_peil: float, opp: float) -> pd.DataFrame:
     """Netto debiet (m³/uur) uit waterhoogte. Positief = instroom."""
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["time","debiet","debiet_in","debiet_uit"])
@@ -196,44 +222,37 @@ def waterhoogte_to_debiet_noneq(df_h: pd.DataFrame, A_peil: float, B_peil: float
     d["dt"] = pd.to_datetime(d["time"], utc=True).diff().dt.total_seconds()
     d = d[d["dt"] > 0].copy()
     d["gradient"] = d["clip"].diff() / d["dt"]
-    d["debiet"] = d["gradient"] * float(s_u) * float(opp) * 3600.0
+    d["debiet"] = d["gradient"] * 1.0 * float(opp) * 3600.0  # s_u = 1.0
     d = d.dropna(subset=["debiet"])
-    d["debiet_in"]  = np.where(d["debiet"] > 0, d["debiet"], np.nan)   # v7.2-gedrag, géén sign-flip
+    d["debiet_in"]  = np.where(d["debiet"] > 0, d["debiet"], np.nan)
     d["debiet_uit"] = np.where(d["debiet"] < 0, d["debiet"], np.nan)
     return d[["time","debiet","debiet_in","debiet_uit"]]
 
-def bedrijf_from_status(df_status: pd.DataFrame, label: str, *, use_bitmask: bool, bit_index: int, threshold: float) -> pd.DataFrame:
-    """Vectorized 0/1 uit status: bitmask (NumPy right_shift) of threshold."""
+def bedrijf_from_status(df_status: pd.DataFrame, label: str, *, bit_index: int) -> pd.DataFrame:
+    """Vectorized 0/1 uit status: bitmask (NumPy right_shift) op vast bit_index."""
     if df_status is None or df_status.empty:
         return pd.DataFrame(columns=["time", f"bedrijf_{label}"])
     d = df_status.copy()
     d["time"] = pd.to_datetime(d["time"], utc=True)
-    s = pd.to_numeric(d["value"], errors="coerce")
-
-    if use_bitmask:
-        iv = s.fillna(0).astype(np.int64)
-        shifted = np.right_shift(iv.to_numpy(), int(bit_index))
-        onoff = pd.Series((shifted & 1), index=d.index, dtype="int64").astype(float)
-    else:
-        onoff = (s > float(threshold)).astype(float)
-
-    d[f"bedrijf_{label}"] = onoff.round(0)  # force 0/1
+    s = pd.to_numeric(d["value"], errors="coerce").fillna(0).astype(np.int64)
+    shifted = np.right_shift(s.to_numpy(), int(bit_index))
+    onoff = pd.Series((shifted & 1), index=d.index, dtype="int64").astype(float)
+    d[f"bedrijf_{label}"] = onoff.round(0)
     d = d.dropna(subset=[f"bedrijf_{label}"]).drop_duplicates("time", keep="last")
     return d[["time", f"bedrijf_{label}"]].sort_values("time")
 
 def abba_berekenen_noneq(df_h, df_p1, df_p2, A_peil, B_peil, opp,
-                         start_utc, end_utc, s_u,
-                         *, use_bitmask_p1, bit_index_p1, thr_p1,
-                            use_bitmask_p2, bit_index_p2, thr_p2) -> pd.DataFrame:
-    d = waterhoogte_to_debiet_noneq(df_h, A_peil, B_peil, opp, s_u=s_u)
+                         start_utc, end_utc, *,
+                         bit_index_p1: int, bit_index_p2: int) -> pd.DataFrame:
+    d = waterhoogte_to_debiet_noneq(df_h, A_peil, B_peil, opp)
     if d.empty:
         return d
     d = d[(d["time"] >= start_utc) & (d["time"] <= end_utc)].copy()
     if d.empty:
         return d
 
-    p1 = bedrijf_from_status(df_p1, "P1", use_bitmask=use_bitmask_p1, bit_index=bit_index_p1, threshold=thr_p1)
-    p2 = bedrijf_from_status(df_p2, "P2", use_bitmask=use_bitmask_p2, bit_index=bit_index_p2, threshold=thr_p2) if df_p2 is not None else pd.DataFrame()
+    p1 = bedrijf_from_status(df_p1, "P1", bit_index=bit_index_p1)
+    p2 = bedrijf_from_status(df_p2, "P2", bit_index=bit_index_p2) if df_p2 is not None and not df_p2.empty else pd.DataFrame()
 
     d = d.sort_values("time")
     if not p1.empty:
@@ -254,28 +273,63 @@ def abba_berekenen_noneq(df_h, df_p1, df_p2, A_peil, B_peil, opp,
 
     return d
 
-# ---------- Sidebar (deel 2): periode & s_u & bits ----------
+# ---------- Sidebar: auth + selectie + periode ----------
 with st.sidebar:
-    st.header("Periode & parameters")
+    st.header("Authenticatie & locatie")
+
+    # ✅ Defensief: None -> "" zodat .strip() nooit crasht
+    prev_token = st.session_state.get("__lizard_token__", "")
+    token_input = st.text_input("API key (verplicht)", value=prev_token or "", type="password")
+    token = (token_input or "").strip()
+    st.session_state["__lizard_token__"] = token or None
+
+    # prev_prefix = st.session_state.get("__abba_prefix__", "212_1")
+    # prefix_input = st.text_input("Locatieprefix", value=prev_prefix or "212_1")
+    # CODE_PREFIX = (prefix_input or "212_1").strip()
+    # st.session_state["__abba_prefix__"] = CODE_PREFIX
+
+    if not token:
+        st.error("Voer een geldige API key in om verder te gaan.")
+        st.stop()
+
+    st.header("Gemaal kiezen")
+    pumps = list_pumpstations()
+    by = st.radio("Selecteer op", ["code", "naam"], index=0, horizontal=True)
+    if pumps.empty:
+        st.warning("Geen gemalen gevonden (Almere/Urk). Voer desnoods handmatig een prefix in.")
+        prefix_input = st.text_input("Locatieprefix (fallback)", value=str(st.session_state.get("__abba_prefix__", "115_8") or "115_8"))
+        CODE_PREFIX = (prefix_input or "115_8").strip()
+    else:
+        opts = pumps["label_code"].tolist() if by == "code" else pumps["label_name"].tolist()
+        default_idx = int(0 if not opts else 0)
+        sel = st.selectbox("Gemaal", opts, index=default_idx)
+        row = pumps.iloc[opts.index(sel)]
+        # Neem de pumpstation code als prefix (zoals 115_8 etc.)
+        CODE_PREFIX = row["code"]
+    st.session_state["__abba_prefix__"] = CODE_PREFIX
+
+    st.header("Periode")
     today_local = pd.Timestamp.now(tz=EU_TZ).floor("D")
     default_start = today_local - pd.Timedelta(days=3)
     start_date = st.date_input("Startdatum", value=default_start.date())
     end_date   = st.date_input("Einddatum",   value=today_local.date())
     start_utc = pd.Timestamp(start_date, tz=EU_TZ).tz_convert("UTC").floor("D")
     end_utc   = (pd.Timestamp(end_date, tz=EU_TZ) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)).tz_convert("UTC")
-    s_u = st.number_input("Schaalfactor s_u", value=1.0, min_value=0.0, step=0.1)
 
-    # st.subheader("Status-interpretatie per pomp")
-    # # ✅ default voor beide pompen = bit 9 (jouw wens)
-    # use_bitmask_p1 = st.checkbox("P1 gebruikt bitmask", value=True)
-    # bit_index_p1   = st.number_input("Bit-index P1 (0=LSB)", value=9, min_value=0, step=1, disabled=not use_bitmask_p1)
-    # thr_p1         = st.number_input("Drempel P1 (> betekent aan)", value=0.0, step=0.001, disabled=use_bitmask_p1)
+# st.write(f"**Prefix:** `{CODE_PREFIX}`")
 
-    # use_bitmask_p2 = st.checkbox("P2 gebruikt bitmask", value=True)
-    # bit_index_p2   = st.number_input("Bit-index P2 (0=LSB)", value=9, min_value=0, step=1, disabled=not use_bitmask_p2)
-    # thr_p2         = st.number_input("Drempel P2 (> betekent aan)", value=0.0, step=0.001, disabled=use_bitmask_p2)
+# ---------- Header met logo's ----------
+left, mid, right = st.columns([1,4,1])
+with left:
+    # Placeholder-logo's; vervang door echte URLs
+    st.image("https://www.almere.nl/_assets/f20fb53eac3716ad4f374a5272077327/Images/logo-almere-turquoise.svg", caption="Almere", use_container_width=True)
+with mid:
+    st.title(f"ABBA-berekening voor gemaal {CODE_PREFIX}")
+    st.caption("voer de ABBA-berekening per gemaal uit voor je eigen gekozen periode. Vergelijk de data en exporteer eventueel.")
+with right:
+    st.image("https://nelen-schuurmans.nl/uploads/Lizard-header-case-1.jpg", caption="Lizard", use_container_width=True)
 
-# ---------- Tijdserieslijst + selectie ----------
+# ---------- Tijdserieslijst + slimme defaults ----------
 with st.spinner("Tijdseries ophalen…"):
     ts_all = list_timeseries_for_prefix(CODE_PREFIX)
 if ts_all.empty:
@@ -303,33 +357,25 @@ if water_df.empty: water_df = ts_all.copy()
 if p1_df.empty:    p1_df = ts_all.copy()
 if p2_df.empty:    p2_df = ts_all.copy()
 
-# ---------- Tijdseries selecteren (met slimme defaults) ----------
-# ---------- Tijdseries selecteren (met slimme defaults en Python-int index) ----------
-
 def _first_pos(mask: pd.Series) -> int | None:
-    """Geef de 0-based positie binnen de gefilterde DataFrame-orde terug als pure int."""
     if mask is None or mask.empty or not mask.any():
         return None
-    # vind het eerste True-label en reken om naar positie t.o.v. de DataFrame-volgorde
     first_label = mask[mask].index[0]
-    # positioneel nummer bepalen: gebruik get_indexer voor een pure int
     pos_arr = mask.index.get_indexer([first_label])
     return int(pos_arr[0]) if len(pos_arr) and pos_arr[0] >= 0 else None
 
-# Waterhoogte (LT5)
+# Waterhoogte
 water_opts = ["— kies —"] + water_df["nice"].tolist()
-default_water_idx = 1 if len(water_opts) > 1 else 0          # eerste echte optie
-# (optioneel nog strenger LT5 zoeken)
+default_water_idx = 1 if len(water_opts) > 1 else 0
 if not water_df.empty:
     lt5_mask = water_df["location"].str.contains("LT5", case=False, na=False)
     pos = _first_pos(lt5_mask)
     if pos is not None:
         default_water_idx = 1 + pos
-default_water_idx = int(max(0, min(default_water_idx, len(water_opts) - 1)))  # pure int + bounds
-
+default_water_idx = int(max(0, min(default_water_idx, len(water_opts) - 1)))
 sel_water = st.selectbox("Waterhoogte (LT5)", water_opts, index=default_water_idx)
 
-# Pompstatus P1
+# P1
 p1_opts = ["— kies —"] + p1_df["nice"].tolist()
 if p1_df.empty:
     default_p1_idx = 0
@@ -338,77 +384,87 @@ else:
     pos = _first_pos(p1_mask)
     default_p1_idx = 1 + pos if pos is not None else 1
 default_p1_idx = int(max(0, min(default_p1_idx, len(p1_opts) - 1)))
-
 sel_p1 = st.selectbox("Pompstatus P1", p1_opts, index=default_p1_idx)
 
-# Pompstatus P2 (optioneel)
+# P2 (optioneel)
 p2_opts = ["— geen —"] + p2_df["nice"].tolist()
-default_p2_idx = 0  # "— geen —"
+default_p2_idx = 0
 if not p2_df.empty:
     p2_mask = p2_df["location"].str.contains("P2", case=False, na=False)
     pos = _first_pos(p2_mask)
     if pos is not None:
         default_p2_idx = 1 + pos
 default_p2_idx = int(max(0, min(default_p2_idx, len(p2_opts) - 1)))
-
 sel_p2 = st.selectbox("Pompstatus P2 (optioneel)", p2_opts, index=default_p2_idx)
 
 if sel_water.startswith("—") or sel_p1.startswith("—"):
     st.info("Kies minstens Waterhoogte en Pompstatus P1.")
     st.stop()
 
-row_w = water_df.loc[water_df["nice"]==sel_water].iloc[0]
+row_w = water_df.loc[water_df["nice"] == sel_water].iloc[0]
 uuid_water = row_w["uuid"]; loc_uuid_water = row_w.get("location_uuid", "")
 
-uuid_p1 = p1_df.loc[p1_df["nice"]==sel_p1, "uuid"].iloc[0]
-uuid_p2 = p2_df.loc[p2_df["nice"]==sel_p2, "uuid"].iloc[0] if sel_p2 != "— geen —" and (p2_df["nice"]==sel_p2).any() else None
+uuid_p1 = p1_df.loc[p1_df["nice"] == sel_p1, "uuid"].iloc[0]
+uuid_p2 = p2_df.loc[p2_df["nice"] == sel_p2, "uuid"].iloc[0] if sel_p2 != "— geen —" and (p2_df["nice"]==sel_p2).any() else None
 
+# ---------- Inputdata ophalen ----------
 with st.spinner("Inputdata ophalen…"):
     df_h  = fetch_events(uuid_water, start_utc.isoformat(), end_utc.isoformat())
     df_p1 = fetch_events(uuid_p1,    start_utc.isoformat(), end_utc.isoformat())
     df_p2 = fetch_events(uuid_p2,    start_utc.isoformat(), end_utc.isoformat()) if uuid_p2 else pd.DataFrame()
 
-# ---------- Inputdata tonen ----------
-with st.expander("Inputdata (eerste 20 rijen)"):
-    colA, colB, colC = st.columns(3)
-    with colA: st.write("Waterhoogte (LT5)"); st.dataframe(df_h.head(20))
-    with colB: st.write("Pompstatus P1");    st.dataframe(df_p1.head(20))
-    with colC: st.write("Pompstatus P2");    st.dataframe(df_p2.head(20) if not df_p2.empty else pd.DataFrame(columns=["time","value"]))
-
-# ---------- LT5 metadata (optioneel A/B/opp) ----------
+# ---------- Metadata A/B/opp ----------
 extra = get_lt5_metadata(CODE_PREFIX)
+
 def _as_float(x, default=0.0):
-    try: return float(x)
-    except Exception: return default
+    try:
+        return float(str(x).replace(",", "."))
+    except Exception:
+        return default
 
-st.subheader("ABBA-parameters (LT5 metadata)")
+st.subheader("ABBA-parameters (LT5)")
 col1, col2, col3 = st.columns(3)
-with col1: A_peil = st.number_input("A-peil (max)", value=_as_float(extra.get("meetniveau_abba_a"), 0.0), step=0.01)
-with col2: B_peil = st.number_input("B-peil (min)", value=_as_float(extra.get("meetniveau_abba_b"), 0.0), step=0.01)
-with col3: opp    = st.number_input("Oppervlakte (m²)", value=_as_float(extra.get("oppervlakte"), 0.0), min_value=0.0, step=0.001)
 
-use_bitmask_p1 = True
-bit_index_p1   = 9
-thr_p1         = 0.0
+with col1:
+    A_peil = st.number_input(
+        "A-peil (max) [m NAP]",
+        value=_as_float(extra.get("meetniveau_abba_a"), -6.10),
+        step=0.01,
+        format="%.2f",
+    )
 
-use_bitmask_p2 = True
-bit_index_p2   = 9
-thr_p2         = 0.0
-# ---------- ABBA-berekening ----------
+with col2:
+    B_peil = st.number_input(
+        "B-peil (min) [m NAP]",
+        value=_as_float(extra.get("meetniveau_abba_b"), -6.20),
+        step=0.01,
+        format="%.2f",
+    )
+
+with col3:
+    opp = st.number_input(
+        "Oppervlakte [m²]",
+        value=_as_float(extra.get("oppervlakte"), 0.0),
+        min_value=0.0,
+        step=0.001,
+        format="%.3f",
+    )
+# ---------- ABBA-berekening (bit 9 / 9) ----------
+BIT_INDEX_P1 = 9
+BIT_INDEX_P2 = 9
 with st.spinner("ABBA-debieten (noneq) berekenen…"):
     df_out = abba_berekenen_noneq(
         df_h=df_h, df_p1=df_p1, df_p2=df_p2 if not df_p2.empty else None,
         A_peil=A_peil, B_peil=B_peil, opp=opp,
-        start_utc=start_utc, end_utc=end_utc, s_u=float(s_u),
-        use_bitmask_p1=use_bitmask_p1, bit_index_p1=int(bit_index_p1), thr_p1=float(thr_p1),
-        use_bitmask_p2=use_bitmask_p2, bit_index_p2=int(bit_index_p2), thr_p2=float(thr_p2),
+        start_utc=start_utc, end_utc=end_utc,
+        bit_index_p1=int(BIT_INDEX_P1), bit_index_p2=int(BIT_INDEX_P2),
     )
 
 if df_out.empty:
     st.warning("Geen resultaten (controleer inputreeksen, periode of metadata).")
     st.stop()
 
-# ---------- Neerslag (precip_cum) ophalen/opbouwen ----------
+# ---------- Neerslag (precip_cum) ----------
 precip_cum = None
 try:
     loc_detail = get_location_detail(loc_uuid_water) if loc_uuid_water else {}
@@ -422,19 +478,96 @@ try:
             pr["neerslag_cum_dag"] = pr.groupby("dag")["neerslag"].cumsum()
             precip_cum = pr.drop(columns=["dag"])
 except Exception:
-    precip_cum = None  # stil vallen: lege neerslaggrafiek
+    precip_cum = None
 
-# ---------- plot_df samenstellen ----------
+# ---------- Result voor plot ----------
 plot_df = df_out.copy()
 plot_df["time_local"] = _to_local(plot_df["time"])
+# pompreeksen positief tekenen (alleen visual)
+plot_df["debiet_pomp_P1_pos"] = -1.0 * plot_df.get("debiet_pomp_P1", pd.Series(index=plot_df.index, dtype=float)).fillna(0.0)
+plot_df["debiet_pomp_P2_pos"] = -1.0 * plot_df.get("debiet_pomp_P2", pd.Series(index=plot_df.index, dtype=float)).fillna(0.0)
 
-# pompreeksen positief tekenen (alleen visueel flip van het teken)
-if "debiet_pomp_P1" in plot_df.columns:
-    plot_df["debiet_pomp_P1_pos"] = -1.0 * plot_df["debiet_pomp_P1"]
-if "debiet_pomp_P2" in plot_df.columns:
-    plot_df["debiet_pomp_P2_pos"] = -1.0 * plot_df["debiet_pomp_P2"]
+# ---------- KPI's: draaiuren, schakelingen, debiet/draaiuren ----------
+def _kpi_runtime_switches_and_ratio(df: pd.DataFrame, bedrijf_col: str, pump_col: str) -> Tuple[float,int,float]:
+    """Return (draaiuren, schakelingen, debiet/draaiuren). debiet/draaiuren = totaal volume / draaiuren."""
+    if df.empty or bedrijf_col not in df or "time" not in df or pump_col not in df:
+        return 0.0, 0, 0.0
+    d = df[["time", bedrijf_col, pump_col]].copy()
+    d = d.sort_values("time")
+    t = pd.to_datetime(d["time"], utc=True)
+    dt = t.diff().dt.total_seconds().fillna(0.0)  # s
+    # draaiuren: som( bedrijf * dt ) / 3600
+    bedrijf = pd.to_numeric(d[bedrijf_col], errors="coerce").fillna(0.0)
+    runtime_h = float((bedrijf * dt).sum() / 3600.0)
+    # schakelingen: count van 0->1 overgangen
+    # NB: rond bedrijf naar 0/1, dan diff>0 is een aan overgang
+    b01 = bedrijf.round(0).astype(int)
+    switches = int(((b01.diff().fillna(0) > 0).sum()))
+    # totaal verpompt volume (m3): integraal van debiet_pomp (negatief) over tijd
+    q = pd.to_numeric(d[pump_col], errors="coerce").fillna(0.0)  # m3/h (negatief bij uitstroom)
+    volume_m3 = float((-1.0 * (q * dt / 3600.0)).sum())  # positief volume
+    ratio = float(volume_m3 / runtime_h) if runtime_h > 0 else 0.0  # m3/uur
+    return runtime_h, switches, ratio
 
-# ---------- Sidebar (deel 3): drempels (clip alléén de debiet-lijn) ----------
+p1_hours, p1_sw, p1_ratio = _kpi_runtime_switches_and_ratio(df_out, "bedrijf_P1", "debiet_pomp_P1")
+p2_hours, p2_sw, p2_ratio = _kpi_runtime_switches_and_ratio(df_out, "bedrijf_P2", "debiet_pomp_P2")
+
+# Toon als 3 boxen (totaal over beide pompen)
+tot_hours = p1_hours + p2_hours
+tot_sw    = p1_sw + p2_sw
+# ratio als gewogen gemiddelde op volume? We nemen volume totaal / uren totaal:
+# Hiervan reeds in helper: volume per pomp / uren pomp; nu voor totaal:
+def _total_ratio(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 0.0
+    d = df.copy().sort_values("time")
+    t = pd.to_datetime(d["time"], utc=True)
+    dt = t.diff().dt.total_seconds().fillna(0.0)
+    q_tot = (d.get("debiet_pomp_P1", 0.0).fillna(0.0) + d.get("debiet_pomp_P2", 0.0).fillna(0.0))
+    # volume positief
+    volume_tot = float((-1.0 * (q_tot * dt / 3600.0)).sum())
+    # draaiuren totaal = som(bedrijf_P1 + bedrijf_P2 > 0 ?) of som beide afzonderlijk?
+    # Jij vroeg "totaal draaiuren (pomp1 + pomp2 opgeteld)" -> som van individuele draaiuren
+    hours_tot = tot_hours
+    return float(volume_tot / hours_tot) if hours_tot > 0 else 0.0
+
+ratio_tot = _total_ratio(df_out)
+
+st.markdown("---")
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.markdown(
+        f"""
+        <div style="border:1px solid #DDD;border-radius:14px;padding:16px;text-align:center;background:#F8FAFF">
+            <div style="font-size:13px;color:#666">Totaal draaiuren (P1+P2)</div>
+            <div style="font-size:28px;color:#696;font-weight:700;margin-top:6px">{tot_hours:.2f} uur</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with c2:
+    st.markdown(
+        f"""
+        <div style="border:1px solid #DDD;border-radius:14px;padding:16px;text-align:center;background:#F8FAFF">
+            <div style="font-size:13px;color:#666">Totaal schakelingen (P1+P2)</div>
+            <div style="font-size:28px;color:#696;font-weight:700;margin-top:6px">{tot_sw:d}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+with c3:
+    st.markdown(
+        f"""
+        <div style="border:1px solid #DDD;border-radius:14px;padding:16px;text-align:center;background:#F8FAFF">
+            <div style="font-size:13px;color:#666">Debiet / draaiuren (gemiddeld)</div>
+            <div style="font-size:28px;color:#696;font-weight:700;margin-top:6px">{ratio_tot:.1f} m³/uur</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+st.markdown("---")
+
+# ---------- Sidebar: drempels (clip alléén de debiet-lijn) ----------
 with st.sidebar:
     st.header("Grafiek-drempels")
     apply_clip = st.checkbox("Drempel-filter voor debietlijn toepassen", value=False)
@@ -455,8 +588,6 @@ with st.sidebar:
         if "debiet" in plot_df.columns:
             plot_df["debiet"] = plot_df["debiet"].clip(lower=d_lo, upper=d_hi)
 
-    # ⚠️ niet clippen: 'debiet_pomp_P1_pos' / 'debiet_pomp_P2_pos'
-
 # ---------- Plotfuncties ----------
 def plot_bedrijf(df: pd.DataFrame, height: int = 240) -> alt.Chart:
     want = {"bedrijf_p1", "bedrijf_p2"}
@@ -467,7 +598,7 @@ def plot_bedrijf(df: pd.DataFrame, height: int = 240) -> alt.Chart:
     for c in cols:
         b[c] = pd.to_numeric(b[c], errors="coerce").fillna(0.0).round(0)
 
-    SCALE = 1000.0  # alleen visualisatie
+    SCALE = 1000.0  # alleen visual
     for c in cols:
         b[c] = b[c] * SCALE
 
@@ -505,8 +636,6 @@ def plot_debiet(df: pd.DataFrame, height: int = 240) -> alt.Chart:
         parts.append(d[["time_local", "debiet_pomp_P2_pos"]].dropna().rename(columns={"debiet_pomp_P2_pos":"waarde"}).assign(serie="pomp2"))
 
     long = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame({"time_local": [], "waarde": [], "serie": []})
-
-    # Alleen geldige reeksen in de plot/legenda
     allowed = {line_label, "pomp1", "pomp2"}
     long = long[long["serie"].isin(allowed)]
 
@@ -564,3 +693,103 @@ c_debiet  = plot_debiet(plot_df,  height=260).add_params(zoom)
 c_rain    = plot_neerslag(precip_cum, height=260).add_params(zoom)
 combo = alt.vconcat(c_bedrijf, c_debiet, c_rain).resolve_scale(x="shared")
 st.altair_chart(combo, use_container_width=True)
+
+# ---------- Export naar Excel ----------
+def export_to_excel(prefix: str,
+                    df_h: pd.DataFrame | None,
+                    df_p1: pd.DataFrame | None,
+                    df_p2: pd.DataFrame | None,
+                    df_out: pd.DataFrame | None,
+                    plot_df: pd.DataFrame | None,
+                    kpis: dict) -> bytes:
+    import io
+    import pandas as pd
+    import numpy as np
+
+    def _safe_df(x: pd.DataFrame | None) -> pd.DataFrame:
+        return x if isinstance(x, pd.DataFrame) and not x.empty else pd.DataFrame()
+
+    def _detz(df: pd.DataFrame) -> pd.DataFrame:
+        """Maak alle datetime-kolommen tz-vrij (naive); werkt ook met datetime64[ns, tz]."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        for c in d.columns:
+            s = d[c]
+            # tz-aware datetime64?
+            if is_datetime64tz_dtype(s):
+                d[c] = s.dt.tz_convert("UTC").dt.tz_localize(None)
+            # naive datetime64 -> laten staan
+            elif is_datetime64_any_dtype(s):
+                continue
+            # soms zitten er Timestamp-objects in object-kolommen
+            elif s.dtype == object:
+                try:
+                    s2 = pd.to_datetime(s, utc=True, errors="raise")
+                    if is_datetime64tz_dtype(s2):
+                        d[c] = s2.dt.tz_convert("UTC").dt.tz_localize(None)
+                    elif is_datetime64_any_dtype(s2):
+                        d[c] = s2  # al naive
+                except Exception:
+                    pass
+        return d
+
+    # Prepare frames (tz-vrij)
+    h   = _detz(_safe_df(df_h))
+    p1  = _detz(_safe_df(df_p1))
+    p2  = _detz(_safe_df(df_p2))
+    out = _detz(_safe_df(df_out))
+    pl  = _detz(_safe_df(plot_df))
+
+    # Meta netjes als strings zonder tz
+    def _fmt(ts):
+        try:
+            return pd.to_datetime(ts).tz_convert("Europe/Amsterdam").tz_localize(None)
+        except Exception:
+            try:
+                return pd.to_datetime(ts).tz_localize(None)
+            except Exception:
+                return str(ts)
+
+    meta = pd.DataFrame({
+        "prefix": [prefix],
+        "periode_start": [_fmt(start_utc)],
+        "periode_eind":  [_fmt(end_utc)],
+        "A_peil": [A_peil],
+        "B_peil": [B_peil],
+        "opp_m2": [opp],
+    })
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        h.to_excel(writer,  index=False, sheet_name="input_waterhoogte")
+        p1.to_excel(writer, index=False, sheet_name="input_status_p1")
+        p2.to_excel(writer, index=False, sheet_name="input_status_p2")
+        out.to_excel(writer, index=False, sheet_name="output_reken")
+        pl.to_excel(writer,  index=False, sheet_name="output_plot")
+        pd.DataFrame([kpis]).to_excel(writer, index=False, sheet_name="KPIs")
+        meta.to_excel(writer, index=False, sheet_name="meta")
+    return buf.getvalue()
+
+
+kpis = {
+    "prefix": CODE_PREFIX,
+    "periode": f"{start_utc} — {end_utc}",
+    "P1_draaiuren_uur": round(p1_hours, 2),
+    "P1_schakelingen": int(p1_sw),
+    "P1_debiet_per_uur_m3ph": round(p1_ratio, 1),
+    "P2_draaiuren_uur": round(p2_hours, 2),
+    "P2_schakelingen": int(p2_sw),
+    "P2_debiet_per_uur_m3ph": round(p2_ratio, 1),
+    "Totaal_draaiuren_uur": round(tot_hours, 2),
+    "Totaal_schakelingen": int(tot_sw),
+    "Totaal_debiet_per_uur_m3ph": round(ratio_tot, 1),
+}
+
+xls_bytes = export_to_excel(CODE_PREFIX, df_h, df_p1, df_p2, df_out, plot_df, kpis)
+st.download_button(
+    "⬇️ Exporteer naar Excel",
+    data=xls_bytes,
+    file_name=f"abba_{CODE_PREFIX}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
